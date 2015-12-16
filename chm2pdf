@@ -82,6 +82,9 @@ class PageLister(sgmllib.SGMLParser):
            if urlparam_flag and key=='value':
                # self.pages.append('/'+value)         
                # Avoid duplicates in the list of URLs.
+               if '#' in value:
+                   value = value.split('#')[0]
+
                if not self.pages.count('/'+value):    
                    self.pages.append('/'+value)      
 
@@ -126,10 +129,16 @@ def get_html_list(cfile):
     if topicstree is not None:
         lister=PageLister()
         lister.feed(topicstree)
-        #print 'lister pages',lister.pages
+        # print 'lister pages',lister.pages
         return lister.pages
 
     topicstree = get_objective_urls_list(cfile.filename, lambda s: s.endswith(('.htm', '.html')))
+
+    # print 'topicstree'
+    # print '=============='
+    # print topicstree
+    # print
+
     if topicstree is None:
         raise RuntimeError('Html files not found inside chm file, nothing to convert!')
     return topicstree
@@ -144,10 +153,11 @@ def get_objective_urls_list(filename, cond = lambda x: True):
     flist=open(CHM2PDF_WORK_DIR+'/urlslist.txt','rU')
     urls_list=[]
     for line in flist.readlines()[3:]:
-        #print 'line',line
+        # print 'line',line
         spline = re.sub(r".*?normal file\s*(.*?)\n$", "\\1", line)
         if cond(spline) and spline[0]=="/":
             urls_list.append(spline)
+	    # print 'url:',spline
     flist.close()
     # os.remove(CHM2PDF_WORK_DIR+'/urlslist.txt')
     
@@ -425,6 +435,9 @@ def convert_to_pdf(cfile, filename, outputfilename, options):
         # Some names contain a '%20' (an HTML code for a space). We substitute with a "real space"
         # otherwise a 'File not found' error will occur.
         page_filename = re.sub('%20',' ',page_filename)
+
+	# if '#' in page_filename: 
+	#    page_filename = page_filename.split('#')[0]
 
         if options['verbose']=='--verbose' and options['verbositylevel']=='high' and options['dontextract'] == '':
             print "Correcting " + page_filename
