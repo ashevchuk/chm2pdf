@@ -28,6 +28,7 @@ import os, os.path
 import re, glob
 import getopt
 # from BeautifulSoup import BeautifulSoup
+import urllib
 
 global version
 
@@ -39,13 +40,30 @@ global CHM2PDF_ORIG_DIR
 global filename #the input filename
 
 version = '0.9.1'
-CHM2PDF_TEMP_WORK_DIR='/tmp/chm2pdf/work' 
+CHM2PDF_TEMP_WORK_DIR='/tmp/chm2pdf/work'
 CHM2PDF_TEMP_ORIG_DIR='/tmp/chm2pdf/orig'
 
 
 
 # YOU DON'T NEED TO CHANGE ANYTHING BELOW THIS LINE!
 
+def quote(s):
+    return '\"' + s + '\"'
+
+def fix_spaces_in_links(page):
+    try:
+        from BeautifulSoup import BeautifulSoup
+    except ImportError:
+        print "BeautifulSoup not installed: links with spaces will not work correctly!"
+        return page
+    soup = BeautifulSoup(page)
+    for link in soup.findAll({'a': True, 'img': True}):
+        try:
+            link['href'] =  urllib.unquote(link['href'])
+            link['src'] = urllib.unquote(link['src'])
+        except KeyError:
+            pass
+    return str(soup)
 
 class PageLister(sgmllib.SGMLParser):
     '''
@@ -55,15 +73,20 @@ class PageLister(sgmllib.SGMLParser):
     def reset(self):
         sgmllib.SGMLParser.reset(self)
         self.pages=[]
-        
+
     def start_param(self,attrs):
        urlparam_flag=False
        for key,value in attrs:
            if key=='name' and value=='Local':
                urlparam_flag=True
            if urlparam_flag and key=='value':
-               self.pages.append('/'+value)  
-     
+               # self.pages.append('/'+value)         
+               # Avoid duplicates in the list of URLs.
+               if not self.pages.count('/'+value):    
+                   self.pages.append('/'+value)      
+
+
+
 class ImageCatcher(sgmllib.SGMLParser):
     '''
     finds image urls in the current html page, so to take them out from the chm file.
@@ -71,14 +94,14 @@ class ImageCatcher(sgmllib.SGMLParser):
     def reset(self):
         sgmllib.SGMLParser.reset(self)
         self.imgurls=[]
-        
+
     def start_img(self,attrs):
         for key,value in attrs:
             if key=='src' or key=='SRC':
                 # Avoid duplicates in the list of image URLs.
                 if not self.imgurls.count(value):
                     self.imgurls.append(value)
-     
+
 class CssCatcher(sgmllib.SGMLParser):
     '''
     finds CSS urls in the current html page, so to take them out from the chm file.
@@ -86,7 +109,7 @@ class CssCatcher(sgmllib.SGMLParser):
     def reset(self):
         sgmllib.SGMLParser.reset(self)
         self.cssurls=[]
-        
+
     def start_link(self,attrs):
         for key,value in attrs:
             if key=='href' or key=='HREF':
@@ -100,23 +123,31 @@ def get_html_list(cfile):
     (actually performed by the PageLister class)
     '''
     topicstree=cfile.GetTopicsTree()
-    lister=PageLister()
-    lister.feed(topicstree)
-    #print 'lister pages',lister.pages
-    return lister.pages
+    if topicstree is not None:
+        lister=PageLister()
+        lister.feed(topicstree)
+        #print 'lister pages',lister.pages
+        return lister.pages
 
-def get_objective_urls_list(filename):
+    topicstree = get_objective_urls_list(cfile.filename, lambda s: s.endswith(('.htm', '.html')))
+    if topicstree is None:
+        raise RuntimeError('Html files not found inside chm file, nothing to convert!')
+    return topicstree
+
+
+def get_objective_urls_list(filename, cond = lambda x: True):
     '''
     takes the list of files inside the chm archive, with the correct urls of each one.
     '''
-
-    os.system('enum_chmLib '+filename+' > '+CHM2PDF_WORK_DIR+'/urlslist.txt')
+    cmd = 'enum_chmLib '+quote(filename)+' > ' + quote(CHM2PDF_WORK_DIR) + '/urlslist.txt'
+    os.system(cmd)
     flist=open(CHM2PDF_WORK_DIR+'/urlslist.txt','rU')
     urls_list=[]
     for line in flist.readlines()[3:]:
         #print 'line',line
-        spline=line.split()
-        urls_list.append(spline[5])
+        spline = re.sub(r".*?normal file\s*(.*?)\n$", "\\1", line)
+        if cond(spline) and spline[0]=="/":
+            urls_list.append(spline)
     flist.close()
     # os.remove(CHM2PDF_WORK_DIR+'/urlslist.txt')
     
@@ -129,33 +160,45 @@ def correct_file(input_file, output_file, html_list, objective_urls, options):
     pf=open(input_file,'rU')
     page=pf.read()
     pf.close()
-        
+
     # Correct the HTML markup of the page, if the --beautifulsoup was passed.
     if options['beautifulsoup']=='--beautifulsoup':
-        from BeautifulSoup import BeautifulSoup, Tag
+        try:
+          from BeautifulSoup import BeautifulSoup
+        except ImportError as e:
+          print
+          print '### An error occured importing soup ', e
+          print '### Check if beautifulsoup is installed or remove --beautifulsoup from the command line'
+          sys.exit()
+
         soup = BeautifulSoup(page)
         page = str(soup)
 
     image_catcher=ImageCatcher()
     image_catcher.feed(page)
-        
+
     css_catcher=CssCatcher()
     css_catcher.feed(page)
-        
+
     # We substitute the image URLs of input_file with the *actual* URLs on the CHM2PDF_ORIG_DIR directory
     for iurl in image_catcher.imgurls:
         # print 'iurl = '  + iurl
 
         img_filename = ''
         for item in objective_urls:
-            if iurl in item:
+            #objective_urls has "real path", whereas image_catcher.imgurls can contain %20!
+            #e.g. item='/doc space/image path/velocity space.gif  iurl=image%20path/velocity%20space.gif
+            iiurl= re.sub('%20',' ',iurl)
+            if iiurl in item:
                 img_filename=CHM2PDF_ORIG_DIR+item
                 if ';' in img_filename: #hack to get rid of mysterious ; in filenames and urls...
                     img_filename=img_filename.split(';')[0]
         # substitute the new image filenames - but only if an img_filename was found!
+        # added (?i) modifier to make a case insensitive match for not breaking working links to images in windows in CHM files
         if img_filename:
-            page=re.sub(iurl,img_filename,page)
-            
+            #r = Python also has "raw strings" which do not apply special treatment to backslashes
+            page=re.sub(r'(?i)"'+iurl,'"'+re.sub('\\\\ ', ' ', img_filename),page)
+
 
     # We substitute the CSS URLs of input_file with the *actual* URLs on the CHM2PDF_ORIG_DIR directory
     for curl in css_catcher.cssurls:
@@ -170,10 +213,10 @@ def correct_file(input_file, output_file, html_list, objective_urls, options):
         # substitute the new image filenames - but only if a css_filename was found!
         if css_filename:
             page=re.sub(curl,css_filename,page)
-            
+
     # Fontsize hack:
     # Since htmldoc ignores the --fontsize option, we have to do something about it...
-    # If --fontsize xxx was given on the command line, 
+    # If --fontsize xxx was given on the command line,
     # insert <font> and </font> tags between <p> and </p>.
     # While doing so, use xxx as the value of the size attribute of the font tag.
     if options['fontsize']:
@@ -198,6 +241,10 @@ def correct_file(input_file, output_file, html_list, objective_urls, options):
     page=re.sub('"[^"]*previous\.gif"','""', page)
     page=re.sub('"[^"]*prev\.gif"','""', page)
     page=re.sub('"[^"]*next\.gif"','""', page)
+
+    # Delete javascript (<script type='text/javascript'>...</script>) 
+    page=re.sub('(?i)<script[^>]*>(.*?)</script>','', page, flags=re.DOTALL|re.MULTILINE)
+
 
     # Delete CSS markup (<link rel="stylesheet"...)
     # Currently, htmldoc chokes on CSS. In some distant, bright future things will be different, but until then...
@@ -299,29 +346,28 @@ def convert_to_pdf(cfile, filename, outputfilename, options):
     # ########################### File extraction and correction: START ############################
     #
     if options['dontextract'] == '':
-    
         try:
-            os.mkdir(CHM2PDF_TEMP_WORK_DIR)
+            os.makedirs(CHM2PDF_TEMP_WORK_DIR)
         except OSError: # The directory already exists.
             pass
-        
+
         try:
-            os.mkdir(CHM2PDF_TEMP_ORIG_DIR)
+            os.makedirs(CHM2PDF_TEMP_ORIG_DIR)
         except OSError: # The directory already exists.
             pass
-        
+
         try:
-            os.mkdir(CHM2PDF_ORIG_DIR)
+            os.makedirs(CHM2PDF_ORIG_DIR)
         except OSError: # The directory already exists.
             pass
-        
+
         try:
-            os.mkdir(CHM2PDF_WORK_DIR)
+            os.makedirs(CHM2PDF_WORK_DIR)
         except OSError: # The directory already exists.
             pass
-   
+
     # Compute filenames and lists. This is needed no matter if '--dontextract' was given or not!
-     
+
     html_list=get_html_list(cfile)
     objective_urls=get_objective_urls_list(filename)
 
@@ -334,15 +380,15 @@ def convert_to_pdf(cfile, filename, outputfilename, options):
     # print html_list
 
     true_html_list=[] #Should mostly coincide with html_list, but...
-   
-    input_titlefile = '' 
-    output_titlefile = '' 
+
+    input_titlefile = ''
+    output_titlefile = ''
     for html_file in html_list:
         for item in objective_urls:
             if html_file in item:
                 true_html_list.append(CHM2PDF_ORIG_DIR+item)
             if not options['titlefile']=='' and options['titlefile'] in item:
-                input_titlefile = CHM2PDF_ORIG_DIR+item
+                input_titlefile = CHM2PDF_ORIG_DIR+re.escape(item)
                 output_titlefile = CHM2PDF_WORK_DIR + os.sep + options['titlefile']
 
     if not options['titlefile']=='' and not output_titlefile:
@@ -354,13 +400,13 @@ def convert_to_pdf(cfile, filename, outputfilename, options):
 
 
     # Process toc file. This depends on the '--dontextract' option.
-    
+
     if options['dontextract'] == '':
         # Correct image links in toc file.
         if not options['titlefile']=='' and os.path.exists(input_titlefile):
             correct_file(input_titlefile, output_titlefile, html_list, objective_urls, options)
 
-    
+
     # Now process the rest of HTML files.
 
     # Compute some lists. Again, this is independent of the '--dontextract' option.
@@ -379,16 +425,16 @@ def convert_to_pdf(cfile, filename, outputfilename, options):
         # Some names contain a '%20' (an HTML code for a space). We substitute with a "real space"
         # otherwise a 'File not found' error will occur.
         page_filename = re.sub('%20',' ',page_filename)
-        
+
         if options['verbose']=='--verbose' and options['verbositylevel']=='high' and options['dontextract'] == '':
             print "Correcting " + page_filename
 
- 
+
         if os.path.exists(page_filename) and (options['titlefile'] == '' or not options['titlefile'] in url):
             htmlout_filename=CHM2PDF_WORK_DIR+'/temp'+'%(#)04d' %{"#":c}+'.html'
-            htmlout_filename_list+=' '+ htmlout_filename
+            htmlout_filename_list+=' '+ quote(htmlout_filename)
             htmlout_filenames.append(htmlout_filename)
-    
+
             if options['dontextract'] == '':
                 # Correct image links in file page_filename.
                 correct_file(page_filename, htmlout_filename, html_list, objective_urls, options)
@@ -397,6 +443,10 @@ def convert_to_pdf(cfile, filename, outputfilename, options):
             url_filename_escaped = re.sub('/', '\/', os.path.basename(url))
             # Escape dots in url.
             url_filename_escaped = re.sub('\.', '\.', url_filename_escaped)
+            # Escape ( in url.                                             
+            url_filename_escaped = re.sub('\(', '\(', url_filename_escaped)
+            # Escape ) in url.                                             
+            url_filename_escaped = re.sub('\)', '\)', url_filename_escaped)
             # Escape slashes in htmlout_filename.
             htmlout_filename_escaped = re.sub('/', '\/', os.path.basename(htmlout_filename))
             # Compute a "garbled" htmlout_filename, where dots are simply replaced with underscores.
@@ -421,12 +471,12 @@ def convert_to_pdf(cfile, filename, outputfilename, options):
             # tol.html	-> temp0001.html -> temptemp0002.html -> temptemptemp0003.html ...
             # 0001.html	-> temp0002.html -> temptemp0003.html -> temptemptemp0004.html ...
             # ...
-            # 
+            #
             # which is not what we want.
             match_strings.append(url_filename_escaped)
             replace_strings.append(htmlout_filename_escaped)
             replace_garbled_strings.append(htmlout_filename_escaped_garbled)
-        
+
     # Now we've got the lists computed. We proceed with the actual correction,
     # which IS dependent on the '--dontextract' option:
 
@@ -434,7 +484,7 @@ def convert_to_pdf(cfile, filename, outputfilename, options):
         # Correct links to files in the local collection.
         if options['verbose']=='--verbose' and options['verbositylevel']=='low':
             print 'Correcting links in the HTML files...'
-    
+
         if options['verbose']=='--verbose' and options['verbositylevel']=='high':
             print '############### 1st pass ###############'
         for match_string in  match_strings:
@@ -443,7 +493,7 @@ def convert_to_pdf(cfile, filename, outputfilename, options):
                 print "match " + match_string + ' ' + "and replace it with " + replace_string
         if options['verbose']=='--verbose' and options['verbositylevel']=='high':
             print
-            
+
         if options['verbose']=='--verbose' and options['verbositylevel']=='high':
             print '############### 2nd pass ###############'
         for match_string in  replace_garbled_strings:
@@ -452,38 +502,51 @@ def convert_to_pdf(cfile, filename, outputfilename, options):
                 print "match " + match_string + ' ' + "and replace it with " + replace_string
         if options['verbose']=='--verbose' and options['verbositylevel']=='high':
             print
-            
+
         for filename in htmlout_filenames:
-            
+
             pf=open(filename,'rU')
             page=pf.read()
             pf.close()
-    
+
+            # Some names contain a '%20' (an HTML code for a space). We substitute with a "real space"
+            # otherwise we won't be able to match to the real files.
+            page = fix_spaces_in_links(page)
+
             # Substitutions in 1st pass: we replace the original filenames with their corresponding "garbled" equivalents.
+            # added (?i) modifier to make a case insensitive match for not breaking working links on windows in CHM files 
+            # added " to the match criteria to avoid wrong match (eg this.htm matched also do_this.htm before)            
             for match_string in  match_strings:
                 replace_string = replace_garbled_strings[match_strings.index(match_string)]
-                page = re.sub(match_string, replace_string, page)
-            
-    
+                page = re.sub('(?i)"'+match_string, '"'+replace_string, page) 
+                #remove also path before..                                                    
+                #eg: ..\other path\this.htm should match "this.htm" but not "do_this.htm"     
+                #this should match "matchstring or "some path\matchstring                     
+                page = re.sub(r'(?i)("|"[^\/"].*?\/)'+match_string, '"'+replace_string, page) 
+                #what if in different paths we have files with the same name?                 
+
             # Substitutuions in the 2nd pass: we replace the garbled filenames with the correct ones.
             for match_string in  replace_garbled_strings:
                 replace_string = replace_strings[replace_garbled_strings.index(match_string)]
                 page = re.sub(match_string, replace_string, page)
-    
-            # Replace links of the form "somefile.html#894" with "somefile0206.html"        
+
+            # Replace links of the form "somefile.html#894" with "somefile0206.html"
             # The following will match anchors like '<a href="temp0206.html#894"' and will store the 'temp0206.html' in backreference 1.
             # The replace string will then replace it with '<a href="temp0206.html"', i.e. it will take away the '#894' part.
-            # This is because the numbers after the '#' are often wrong or non-existent. It is better to link to an existing 
+            # This is because the numbers after the '#' are often wrong or non-existent. It is better to link to an existing
             # chapter than to a non-existent part of an existing chapter.
-            page = re.sub('<a href="([^#]*)#[^"]*"', '<a href="\\1"', page)
-    
+            # page = re.sub('(?i)<a href="([^#|"]*)#[^"]*"', '<a href="\\1"', page) 
+            # This leaves internal page links of the form "#.." intact              
+            page = re.sub('(?i)<a href="([^#|"]+)#[^"]*"', '<a href="\\1"', page)   
+
             pf=open(filename,'w')
             pf.write(page)
-            pf.close
+            pf.flush()
+            pf.close()
 
     # Here ends the extraction and correction of the HTML files which, as said above,
     # will take place ONLY IF '--dontextract' was NOT given.
-    # If '--dontextract' was given, only the file lists like htmlout_filename_list 
+    # If '--dontextract' was given, only the file lists like htmlout_filename_list
     # were computed above, but no file extraction or correction took place.
     #
     # ########################### File extraction and correction: END   ############################
@@ -588,18 +651,19 @@ def convert_to_pdf(cfile, filename, outputfilename, options):
             elif key=='user-password': htmldoc_opts += ' --user-password ' + value
             elif key=='version': htmldoc_opts += ' ' + value
             elif key=='webpage': htmldoc_opts += ' ' + value
-           
+
+    cmd = 'htmldoc' + htmldoc_opts + ' ' + htmlout_filename_list + " -f "+ quote(outputfilename) + " > /dev/null"
     if options['verbose']=='--verbose' and options['verbositylevel']=='high':
-        print 'htmldoc' + htmldoc_opts + ' ' + htmlout_filename_list + " -f "+ outputfilename + " > /dev/null"
-    exit_value=os.system ('htmldoc' + htmldoc_opts + ' ' + htmlout_filename_list + " -f "+ outputfilename + " > /dev/null")
+        print cmd
+    exit_value=os.system (cmd)
 
     if exit_value != 0:
         print 'Something wrong happened when launching htmldoc.'
         print 'exit value: ',exit_value
         print 'Check if output exists or if it is good.'
-    else: 
+    else:
         print 'Written file ' + outputfilename
-    print 'Done.'    
+    print 'Done.'
 
 def usage (name):
     print 'Usage:'
@@ -832,7 +896,7 @@ def main(argv):
     options['webpage'] = ''
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "f:t:v:", 
+        opts, args = getopt.getopt(sys.argv[1:], "f:t:v:",
                      [
                       "beautifulsoup",
                       "bodycolor=",
@@ -930,7 +994,7 @@ def main(argv):
     except getopt.GetoptError:
         usage(sys.argv[0])
         sys.exit(1)
-    
+
     for o, a in opts:
         if   o == '--beautifulsoup': options['beautifulsoup'] = '--beautifulsoup'
         elif o == '--bodycolor': options['bodycolor'] = a
@@ -1022,7 +1086,7 @@ def main(argv):
         elif o == '--user-password': options['user-password'] = a
         elif o in ('-v', '--verbose'): options['verbose'] = '--verbose'
         elif o == '--verbositylevel': options['verbositylevel'] = a
-        elif o == '--version': 
+        elif o == '--version':
             print sys.argv[0] + ' version ' + version
             print 'This is free software; see the source for copying conditions.  There is NO'
             print 'warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.'
@@ -1041,7 +1105,7 @@ def main(argv):
         return
     #
     # One of '--book' or '--webpage' MUST be given!
-    if options['extract-only'] == '' and ((options['book'] == '' and options['webpage'] == '' and options['continuous'] == '') or 
+    if options['extract-only'] == '' and ((options['book'] == '' and options['webpage'] == '' and options['continuous'] == '') or
                                           (options['book'] == '--book' and options['webpage'] == '--webpage') or
                                           (options['book'] == '--book' and options['continuous'] == '--continuous') or
                                           (options['webpage'] == '--webpage' and options['continuous'] == '--continuous')):
@@ -1057,7 +1121,7 @@ def main(argv):
         return
     elif len(args)==1:
         filename = args[0]
-        dirname, basename, suffix = split(filename)
+        dirname, basename, suffix = split(filename)        
         if dirname:
             outputfilename = dirname + os.sep + basename +'.pdf'
         else:
@@ -1072,7 +1136,7 @@ def main(argv):
     else:
         usage(sys.argv[0])
         return
- 
+
     CHM2PDF_WORK_DIR = CHM2PDF_TEMP_WORK_DIR + os.sep + basename
     CHM2PDF_ORIG_DIR = CHM2PDF_TEMP_ORIG_DIR + os.sep + basename
 
@@ -1083,14 +1147,16 @@ def main(argv):
     if not os.path.exists(filename):
         print 'CHM file "' + filename + '" not found!'
         return
-    
+
     #remove temporary files
     if options['dontextract'] == '':
         if options['verbose']=='--verbose' and options['verbositylevel']=='high':
             print 'Removing any previous temporary files...'
-        os.system('rm -r '+CHM2PDF_ORIG_DIR+'/*')
-        os.system('rm -r '+CHM2PDF_WORK_DIR+'/*')
-    
+        try:
+            os.rmdir(CHM2PDF_ORIG_DIR)
+            os.rmdir(CHM2PDF_WORK_DIR)
+        except OSError:
+            pass
     cfile = chm.CHMFile()
     cfile.LoadCHM(filename)
 
@@ -1100,13 +1166,13 @@ def main(argv):
             print 'Will use the files in ' + CHM2PDF_ORIG_DIR + ' and ' + CHM2PDF_WORK_DIR + '.'
     else:
         if options['verbose'] == '--verbose' and options['verbositylevel'] == 'high':
-            os.system('extract_chmLib ' + filename + ' ' + CHM2PDF_ORIG_DIR)
+            os.system('extract_chmLib ' + quote(filename) + ' ' + quote(CHM2PDF_ORIG_DIR))
         else:
-            os.system('extract_chmLib ' + filename + ' ' + CHM2PDF_ORIG_DIR + '&> /dev/null')
-    
+            os.system('extract_chmLib ' + quote(filename) + ' ' + quote(CHM2PDF_ORIG_DIR) + '&> /dev/null')
+
     convert_to_pdf(cfile, filename, outputfilename, options)
 
 
 if __name__ == '__main__':
     main(sys.argv)
-    
+

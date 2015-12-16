@@ -1,6 +1,7 @@
 chm2pdf
 =======
 A Python script that converts a CHM file into a single PDF file.
+(c) 2015 Andrew Shevchuk fixed version
 
 (c) 2007 Massimo Sandal <devicerandom@gmail.com>
 
